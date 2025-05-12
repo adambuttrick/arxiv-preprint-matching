@@ -101,4 +101,4 @@ The strategy employs weighted scoring based on year, title, and author similarit
 
 1.  Only candidates achieving a final weighted score >= `min_score` (default 0.85) are considered potential matches.
 2.  Among these, only candidates whose scores are within `max_score_diff` (default 0.03) of the *highest* score obtained for that input record are returned as the final match(es). This helps select the best result(s) when multiple candidates have very similar high scores.
-```
+
