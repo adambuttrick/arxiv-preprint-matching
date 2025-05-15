@@ -128,13 +128,11 @@ def extract_doi_from_url(url_string):
                 else:
                     logging.debug(f"URL '{url_string}' is not a doi.org URL and doesn't look like a DOI.")
                     return None
-
         doi_path = doi_path.strip()
         if doi_path:
             return doi_path
         else:
             return None
-
     except Exception as e:
         logging.warning(f"Could not parse URL/DOI string '{url_string}' to extract DOI: {e}")
     return None
@@ -207,10 +205,10 @@ def process_single_file(input_file_path, output_file_path, matching_strategy, ar
         os.makedirs(os.path.dirname(output_file_path), exist_ok=True)
 
         with open_func(input_file_path, read_mode, encoding='utf-8') as infile, \
-                open(output_file_path, write_mode, encoding='utf-8') as outfile:
+             open(output_file_path, write_mode, encoding='utf-8') as outfile:
 
             if args.format == 'csv':
-                fieldnames = ['input_doi', 'matched_doi']
+                fieldnames = ['input_doi', 'matched_doi', 'confidence']
                 output_writer = csv.DictWriter(outfile, fieldnames=fieldnames)
                 output_writer.writeheader()
                 main_logger.debug(f"CSV writer initialized for {output_file_path}.")
@@ -227,6 +225,7 @@ def process_single_file(input_file_path, output_file_path, matching_strategy, ar
                 main_logger.debug(f"--- Processing Line {line_num} in {os.path.basename(input_file_path)} ---")
                 input_doi_extracted = "N/A"
                 matched_doi_extracted = None
+                match_confidence_str = ""
                 output_record = None
                 line_processed_successfully = True
 
@@ -235,55 +234,62 @@ def process_single_file(input_file_path, output_file_path, matching_strategy, ar
                         input_json_string = line
                         input_data_parsed = json.loads(line)
                         if isinstance(input_data_parsed, dict):
-                            input_doi_extracted = input_data_parsed.get(
-                                'id') or input_data_parsed.get('doi')
+                            input_doi_extracted = input_data_parsed.get('id') or input_data_parsed.get('doi')
                             if not input_doi_extracted:
                                 main_logger.warning(f"Line {line_num} in {input_file_path}: Input JSON lacks 'id' or 'doi' field.")
                                 input_doi_extracted = "N/A_MISSING_ID"
                             else:
-                                input_doi_extracted = str(input_doi_extracted).replace(
-                                    "https://doi.org/", "").replace("doi:", "").strip()
+                                input_doi_extracted = str(input_doi_extracted).replace("https://doi.org/", "").replace("doi:", "").strip()
                                 main_logger.debug(f"Line {line_num}: Input DOI identified as '{input_doi_extracted}'.")
                         else:
                             main_logger.warning(f"Line {line_num} in {input_file_path}: Parsed JSON is not a dictionary (type: {type(input_data_parsed)}).")
                             input_doi_extracted = "N/A_INVALID_JSON_TYPE"
-
                     except json.JSONDecodeError as e:
                         main_logger.error(f"Line {line_num} in {input_file_path}: JSON decode error: {e}. Raw line (start): '{line[:100]}...'")
                         line_processed_successfully = False
-                        continue
 
-                    matches = matching_strategy.match(input_json_string)
+                    if line_processed_successfully:
+                        matches = matching_strategy.match(input_json_string)
 
-                    if matches is None:
-                        main_logger.error(f"Line {line_num} (Input DOI {input_doi_extracted}) in {input_file_path}: Strategy reported critical failure (likely API issue).")
-                        line_processed_successfully = False
-                    elif matches and isinstance(matches, list) and len(matches) > 0:
-                        first_match = matches[0]
-                        matched_doi_url = None
-                        if isinstance(first_match, dict):
-                            matched_doi_url = first_match.get('id')
-                            confidence = first_match.get('confidence', 'N/A')
-                            conf_str = f"{confidence:.4f}" if isinstance(confidence, (int, float)) else str(confidence)
+                        if matches is None:
+                            main_logger.error(f"Line {line_num} (Input DOI {input_doi_extracted}) in {input_file_path}: Strategy reported critical failure (likely API issue).")
+                            line_processed_successfully = False
+                        elif matches and isinstance(matches, list) and len(matches) > 0:
+                            first_match = matches[0]
+                            matched_doi_url = None
+                            if isinstance(first_match, dict):
+                                matched_doi_url = first_match.get('id')
+                                confidence = first_match.get('confidence')
 
-                            if matched_doi_url:
-                                matched_lines += 1
-                                main_logger.info(f"Line {line_num} (Input DOI {input_doi_extracted}): Found match '{matched_doi_url}' conf {conf_str}")
-                                matched_doi_extracted = extract_doi_from_url(
-                                    matched_doi_url)
-                                if not matched_doi_extracted:
-                                    main_logger.warning(f"Line {line_num} (Input DOI {input_doi_extracted}): Could not extract DOI from matched URL '{matched_doi_url}'.")
+                                if isinstance(confidence, (int, float)):
+                                    match_confidence_str = f"{confidence:.4f}"
+                                elif confidence is not None:
+                                    match_confidence_str = str(confidence)
+                                else:
+                                    match_confidence_str = ''
+
+                                if matched_doi_url:
+                                    matched_lines += 1
+                                    main_logger.info(f"Line {line_num} (Input DOI {input_doi_extracted}): Found match '{matched_doi_url}' conf {match_confidence_str if match_confidence_str else 'N/A'}")
+                                    matched_doi_extracted = extract_doi_from_url(matched_doi_url)
+                                    if not matched_doi_extracted:
+                                        main_logger.warning(f"Line {line_num} (Input DOI {input_doi_extracted}): Could not extract DOI from matched URL '{matched_doi_url}'.")
+                                        match_confidence_str = ''
+                                else:
+                                    main_logger.warning(f"Line {line_num} (Input DOI {input_doi_extracted}): Match result dictionary lacks 'id' field: {first_match}")
+                                    match_confidence_str = ''
                             else:
-                                main_logger.warning(f"Line {line_num} (Input DOI {input_doi_extracted}): Match result dictionary lacks 'id' field: {first_match}")
+                                main_logger.warning(f"Line {line_num} (Input DOI {input_doi_extracted}): Match result item is not a dictionary: {type(first_match)}")
+                                match_confidence_str = ''
                         else:
-                            main_logger.warning(f"Line {line_num} (Input DOI {input_doi_extracted}): Match result item is not a dictionary: {type(first_match)}")
-                    else:
-                        main_logger.info(f"Line {line_num} (Input DOI {input_doi_extracted}): No preprint match found.")
+                            main_logger.info(f"Line {line_num} (Input DOI {input_doi_extracted}): No preprint match found.")
+                            match_confidence_str = ''
 
                     if line_processed_successfully:
                         output_record = {
                             "input_doi": input_doi_extracted if not input_doi_extracted.startswith("N/A") else '',
-                            "matched_doi": matched_doi_extracted if matched_doi_extracted else ''
+                            "matched_doi": matched_doi_extracted if matched_doi_extracted else '',
+                            "confidence": match_confidence_str if matched_doi_extracted else ''
                         }
 
                 except Exception as e:
@@ -303,7 +309,7 @@ def process_single_file(input_file_path, output_file_path, matching_strategy, ar
 
                     if args.max_consecutive_line_failures > 0 and consecutive_line_failures >= args.max_consecutive_line_failures:
                         main_logger.critical(f"Line-level circuit breaker tripped for file {input_file_path}: Reached {consecutive_line_failures} consecutive line failures "
-                                             f"(threshold: {args.max_consecutive_line_failures}). Halting processing for this file.")
+                                            f"(threshold: {args.max_consecutive_line_failures}). Halting processing for this file.")
                         file_halted_by_line_breaker = True
                         break
 
@@ -315,22 +321,21 @@ def process_single_file(input_file_path, output_file_path, matching_strategy, ar
                                 output_writer.writerow(output_record)
                             except Exception as e:
                                 main_logger.error(f"Line {line_num}: Failed to write row to CSV for {output_file_path}: {e}. Data: {output_record}", exc_info=True)
-                                lines_with_errors += 1
-                                consecutive_line_failures += 1
+                                lines_with_errors +=1
+                                consecutive_line_failures +=1
                                 main_logger.warning(f"Consecutive line failure count (CSV write error): {consecutive_line_failures}")
                                 if args.max_consecutive_line_failures > 0 and consecutive_line_failures >= args.max_consecutive_line_failures:
                                     main_logger.critical(f"Line-level circuit breaker tripped after CSV write error for {input_file_path}. Halting.")
                                     file_halted_by_line_breaker = True
                                     break
 
-                    if processed_lines % 100 == 0 and not file_halted_by_line_breaker:
-                        main_logger.info(f"Progress for {os.path.basename(input_file_path)}: Processed {processed_lines} lines... ({matched_lines} matched, {lines_with_errors} errors, {consecutive_line_failures} consecutive)")
+                if processed_lines % 100 == 0 and not file_halted_by_line_breaker:
+                    main_logger.info(f"Progress for {os.path.basename(input_file_path)}: Processed {processed_lines} lines... ({matched_lines} matched, {lines_with_errors} errors, {consecutive_line_failures} consecutive)")
 
             if args.format == 'json' and not file_halted_by_line_breaker:
                 main_logger.info(f"Writing {len(all_results_json)} collected results as JSON to {output_file_path}...")
                 try:
-                    json.dump(output_writer, outfile,
-                              ensure_ascii=False, indent=2)
+                    json.dump(all_results_json, outfile, ensure_ascii=False, indent=2)
                     main_logger.info("JSON writing complete.")
                 except Exception as e:
                     main_logger.error(f"Failed to write JSON output to file '{output_file_path}': {e}", exc_info=True)
@@ -356,10 +361,9 @@ def process_single_file(input_file_path, output_file_path, matching_strategy, ar
         main_logger.info(f"  Total lines processed: {processed_lines}")
         main_logger.info(f"  Lines resulting in a match: {matched_lines}")
         if lines_with_errors > 0:
-            main_logger.warning(f"  Total lines with errors (or file error): {lines_with_errors}")
+            main_logger.warning(f"  Total lines with errors (or file error like final write): {lines_with_errors}")
         else:
-            main_logger.info(
-                "  No line processing errors encountered for this file.")
+            main_logger.info("  No line processing errors or final write errors encountered for this file.")
         main_logger.info(f"  Results written to: {output_file_path} (Format: {args.format.upper()})")
 
     return lines_with_errors == 0 and not file_halted_by_line_breaker
@@ -399,8 +403,7 @@ def main():
             log_candidates=args.log_candidates,
             candidate_log_file=args.candidate_log_file
         )
-        main_logger.info(
-            "Preprint matching strategy initialized successfully.")
+        main_logger.info("Preprint matching strategy initialized successfully.")
     except Exception as e:
         main_logger.critical(f"Fatal Error: Could not initialize strategy: {e}", exc_info=True)
         sys.exit(1)
@@ -419,8 +422,7 @@ def main():
     if args.max_consecutive_file_failures > 0:
         main_logger.info(f"File-level circuit breaker enabled: Halting script after {args.max_consecutive_file_failures} consecutive file processing failures.")
     else:
-        main_logger.info(
-            "File-level circuit breaker disabled (max_consecutive_file_failures <= 0).")
+        main_logger.info("File-level circuit breaker disabled (max_consecutive_file_failures <= 0).")
 
     total_files_processed = 0
     total_files_failed_or_halted = 0
@@ -432,12 +434,11 @@ def main():
             base, ext = os.path.splitext(relative_path)
             if base.lower().endswith(".jsonl"):
                 base, _ = os.path.splitext(base)
-
+            
             output_filename = f"{base}.output.{args.format}"
             output_file_path = os.path.join(args.output, output_filename)
 
-            success = process_single_file(
-                input_file_path, output_file_path, matching_strategy, args)
+            success = process_single_file(input_file_path, output_file_path, matching_strategy, args)
             total_files_processed += 1
 
             if not success:
@@ -448,7 +449,7 @@ def main():
                 if consecutive_file_failures > 0:
                     main_logger.info(f"Resetting consecutive file failure count from {consecutive_file_failures} after successful file {input_file_path}.")
                 consecutive_file_failures = 0
-
+            
             if args.max_consecutive_file_failures > 0 and consecutive_file_failures >= args.max_consecutive_file_failures:
                 main_logger.critical(f"File-level circuit breaker tripped: Reached {consecutive_file_failures} consecutive file processing failures "
                                      f"(threshold: {args.max_consecutive_file_failures}). Halting script.")
@@ -460,8 +461,7 @@ def main():
             main_logger.critical(f"Fatal error during processing orchestration for {input_file_path}: {e}", exc_info=True)
             total_files_failed_or_halted += 1
             consecutive_file_failures += 1
-            main_logger.critical(
-                "Attempting to continue with next file, but incrementing consecutive file failure count.")
+            main_logger.critical("Attempting to continue with next file, but incrementing consecutive file failure count.")
             if args.max_consecutive_file_failures > 0 and consecutive_file_failures >= args.max_consecutive_file_failures:
                 main_logger.critical(f"File-level circuit breaker tripped after orchestration error: Reached {consecutive_file_failures} consecutive failures. Halting script.")
                 sys.exit(1)
@@ -472,8 +472,7 @@ def main():
     if total_files_failed_or_halted > 0:
         main_logger.warning(f"Total files with errors or halted by line/file circuit breakers: {total_files_failed_or_halted}")
     else:
-        main_logger.info(
-            "All attempted files processed without critical errors or halts.")
+        main_logger.info("All attempted files processed without critical errors or halts.")
     main_logger.info(f"Final consecutive file failure count: {consecutive_file_failures}")
     main_logger.info("--- Script Finished ---")
 
