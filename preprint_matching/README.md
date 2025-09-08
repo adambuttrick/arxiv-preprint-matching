@@ -41,6 +41,13 @@ python preprint_match_data_files.py -i INPUT_DIR -f FORMAT -m EMAIL -u USER_AGEN
 - `--weight-author`: Weight for the author score component (default: 0.8).
 - `--max-query-len`: Maximum length of the query string sent to Crossref (default: 5000).
 
+#### Reranking Parameters (Optional):
+- `--enable-reranker`: Enable ColBERT reranking step for improved matching accuracy (default: False).
+- `--reranker-model-path`: Path or HuggingFace model name for ColBERT reranker (default: 'lightonai/GTE-ModernColBERT-v1').
+- `--reranker-batch-size`: Batch size for reranker's encode method (default: 16).
+- `--heuristic-weight`: Weight of original heuristic score in hybrid calculation (default: 0.3).
+- `--reranker-weight`: Weight of reranker score in hybrid calculation (default: 0.7).
+
 #### File Processing & API Handling:
 - `--timeout`: Request timeout (connect, read) in seconds (default: 10 30).
 - `--max-retries`: Maximum number of retries for failed API requests (default: 3).
@@ -62,7 +69,15 @@ Process files in `preprints/`, saving JSON results to the default `./output` dir
 python preprint_match_data_files.py -i preprints/ -f json -m <your_email@example.com> -u "arXivPreprintMatcher/1.0" \
  -ll DEBUG -lf matching.log -lc \
  --min-score 0.8 --weight-title 1.5 --weight-author 1.0 \
- --timeout 15 45 --max-retries 5 --max-consecutive-failures 20
+ --timeout 15 45 --max-retries 5 --max-consecutive-line-failures 20
+```
+
+Process with ColBERT reranking enabled:
+
+```bash
+python preprint_match_data_files.py -i input_data/ -o output_results/ -f csv -m <your_email@example.com> -u "MyMatchingTool/1.1" \
+ --enable-reranker --reranker-model-path "lightonai/GTE-ModernColBERT-v1" \
+ --heuristic-weight 0.3 --reranker-weight 0.7
 ```
 
 ## Description of Strategy
@@ -101,4 +116,27 @@ The strategy employs weighted scoring based on year, title, and author similarit
 
 1.  Only candidates achieving a final weighted score >= `min_score` (default 0.85) are considered potential matches.
 2.  Among these, only candidates whose scores are within `max_score_diff` (default 0.03) of the *highest* score obtained for that input record are returned as the final match(es). This helps select the best result(s) when multiple candidates have very similar high scores.
+
+### ColBERT Reranking (Optional)
+
+When enabled with `--enable-reranker`, the strategy incorporates a neural reranking step using Pylate's ColBERT implementation to improve matching accuracy:
+
+#### How it Works:
+1. The traditional heuristic-based scoring (year, title, author) is performed first on all candidates retrieved from Crossref.
+2. For reranking, text representations are created by combining titles and author names from both the input preprint and candidate matches.
+3. The ColBERT model generates dense embeddings for both the query (input preprint) and candidate documents.
+4. The model computes similarity scores between the query and each candidate using late interaction (MaxSim) between token embeddings.
+5. Reranker scores are normalized to [0, 1] range using min-max normalization across all candidates.
+6. Final scores combine both heuristic and reranker scores using configurable weights:
+   - Final Score = (`heuristic_weight` × heuristic_score) + (`reranker_weight` × reranker_score)
+   - Default weights: 0.3 for heuristic, 0.7 for reranker
+
+
+#### Configuration:
+- Model: Default uses `lightonai/GTE-ModernColBERT-v1`, but any ColBERT-compatible model can be specified
+- Batch size: Adjust `--reranker-batch-size` based on available memory (default: 16)
+- Weighting: Tune `--heuristic-weight` and `--reranker-weight` to balance traditional and neural scoring
+
+#### Fallback Behavior:
+If reranking fails (missing dependencies, model loading errors, or runtime exceptions), the system automatically falls back to heuristic-only scoring with appropriate logging.
 

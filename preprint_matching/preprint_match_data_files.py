@@ -109,6 +109,27 @@ def parse_arguments():
         help=f"Maximum number of consecutive files that fail processing before halting the entire script (default: {DEFAULT_MAX_CONSECUTIVE_FILE_FAILURES}). Set to 0 to disable."
     )
 
+    parser.add_argument(
+        '--enable-reranker', action='store_true', default=False,
+        help="Enable ColBERT reranking step for improved matching (default: False)."
+    )
+    parser.add_argument(
+        '--reranker-model-path', type=str, default='lightonai/GTE-ModernColBERT-v1',
+        help="Path or HuggingFace model name for ColBERT reranker (default: 'lightonai/GTE-ModernColBERT-v1')."
+    )
+    parser.add_argument(
+        '--reranker-batch-size', type=int, default=16,
+        help="Batch size for reranker's encode method (default: 16)."
+    )
+    parser.add_argument(
+        '--heuristic-weight', type=float, default=0.3,
+        help="Weight of original heuristic score in hybrid calculation (default: 0.3)."
+    )
+    parser.add_argument(
+        '--reranker-weight', type=float, default=0.7,
+        help="Weight of reranker score in hybrid calculation (default: 0.7)."
+    )
+
     return parser.parse_args()
 
 
@@ -401,7 +422,12 @@ def main():
             backoff_factor=args.backoff_factor,
             logger_instance=logging.getLogger('strategy'),
             log_candidates=args.log_candidates,
-            candidate_log_file=args.candidate_log_file
+            candidate_log_file=args.candidate_log_file,
+            enable_reranker=args.enable_reranker,
+            reranker_model_path=args.reranker_model_path,
+            reranker_batch_size=args.reranker_batch_size,
+            heuristic_weight=args.heuristic_weight,
+            reranker_weight=args.reranker_weight
         )
         main_logger.info("Preprint matching strategy initialized successfully.")
     except Exception as e:

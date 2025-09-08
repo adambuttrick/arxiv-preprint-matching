@@ -1,7 +1,7 @@
 import os
 import csv
-import json
 import sys
+import json
 import time
 import argparse
 import itertools
@@ -10,7 +10,7 @@ import pandas as pd
 from datetime import datetime
 
 
-PARAM_GRID = {
+DEFAULT_PARAM_GRID = {
     'min_score': [0.80, 0.85, 0.90],
     'max_score_diff': [0.03, 0.04, 0.05],
     'weight_year': [0.3, 0.4, 0.5],
@@ -18,16 +18,27 @@ PARAM_GRID = {
     'weight_author': [0.8, 1.0, 1.2]
 }
 
+RERANKER_WEIGHT_GRID = {
+    'min_score': [0.80, 0.85, 0.90],
+    'max_score_diff': [0.03, 0.04, 0.05],
+    'weight_year': [0.4],
+    'weight_title': [2.0],
+    'weight_author': [1.0],
+    'heuristic_weight': [0.2, 0.3, 0.4],
+    'reranker_weight': [0.8, 0.7, 0.6],
+    'reranker_batch_size': [16]
+}
+
 MATCHER_SCRIPT = "preprint_match_data_files.py"
 EVALUATOR_SCRIPT = "calculate_precision_recall_f-scores.py"
 
-ALL_POSSIBLE_FIELDS = list(PARAM_GRID.keys()) + [
+BASE_FIELDS = [
     "Status", "Error", "TP", "FP", "FN", "Precision", "Recall",
     "F0.5", "F1", "F1.5", "Positive References", "Positive Predictions"
 ]
 
 
-def run_command(command_list, timeout=300):
+def run_command(command_list, timeout=1800):
     try:
         print(f"Running command: {' '.join(command_list)}")
         process = subprocess.run(
@@ -109,10 +120,50 @@ def main():
         help="Set the logging level for the matcher script subprocess (default: WARNING)."
     )
 
+    parser.add_argument(
+        "--enable-reranker", action='store_true',
+        help="Enable ColBERT reranker optimization (test with reranker enabled)."
+    )
+    parser.add_argument(
+        "--reranker-model-path", default='lightonai/GTE-ModernColBERT-v1',
+        help="Path or HuggingFace model name for ColBERT reranker (default: lightonai/GTE-ModernColBERT-v1)."
+    )
+    parser.add_argument(
+        "--optimize-reranker-weights", action='store_true',
+        help="Optimize heuristic vs reranker weight balance (requires --enable-reranker)."
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=None,
+        help="Override timeout in seconds for matcher script (default: auto-calculated based on dataset size)."
+    )
+
     args = parser.parse_args()
+
+    if args.optimize_reranker_weights and not args.enable_reranker:
+        print("Error: --optimize-reranker-weights requires --enable-reranker")
+        sys.exit(1)
+
+    args.input_sample = os.path.abspath(args.input_sample)
+    args.reference_csv = os.path.abspath(args.reference_csv)
+    args.output_results_csv = os.path.abspath(args.output_results_csv)
+    args.matcher_script_path = os.path.abspath(args.matcher_script_path)
+    args.evaluator_script_path = os.path.abspath(args.evaluator_script_path)
+    args.temp_dir = os.path.abspath(args.temp_dir)
 
     os.makedirs(args.temp_dir, exist_ok=True)
     print(f"Using temporary directory: {args.temp_dir}")
+
+    if args.enable_reranker and args.optimize_reranker_weights:
+        PARAM_GRID = RERANKER_WEIGHT_GRID
+        print("Optimizing with reranker enabled and weight balance optimization")
+    else:
+        PARAM_GRID = DEFAULT_PARAM_GRID
+        if args.enable_reranker:
+            print("Running with reranker enabled using default weights")
+        else:
+            print("Optimizing heuristic-only parameters")
+
+    ALL_POSSIBLE_FIELDS = list(PARAM_GRID.keys()) + BASE_FIELDS
 
     param_combinations = generate_parameter_combinations(PARAM_GRID)
     total_runs = len(param_combinations)
@@ -133,7 +184,7 @@ def main():
 
         result_row = {**params}
 
-        temp_matcher_output_csv = os.path.join(args.temp_dir, f"run_{run_number}_matches.csv")
+        temp_matcher_output_csv = os.path.abspath(os.path.join(args.temp_dir, f"run_{run_number}_matches.csv"))
 
         matcher_cmd = [
             sys.executable,
@@ -151,8 +202,42 @@ def main():
             "--weight-author", str(params['weight_author']),
         ]
 
+        if args.enable_reranker:
+            matcher_cmd.extend([
+                "--enable-reranker",
+                "--reranker-model-path", args.reranker_model_path,
+            ])
+
+            if 'heuristic_weight' in params:
+                matcher_cmd.extend([
+                    "--heuristic-weight", str(params['heuristic_weight']),
+                    "--reranker-weight", str(params['reranker_weight']),
+                ])
+            if 'reranker_batch_size' in params:
+                matcher_cmd.extend([
+                    "--reranker-batch-size", str(
+                        params['reranker_batch_size']),
+                ])
+
+        if args.timeout:
+            estimated_timeout = args.timeout
+            print(f"Using user-specified timeout of {estimated_timeout} seconds")
+        else:
+            timeout_per_entry = 2 if args.enable_reranker else 0.5
+            min_timeout = 300
+
+            try:
+                with open(args.input_sample, 'r') as f:
+                    num_entries = sum(1 for line in f if line.strip())
+                estimated_timeout = max(min_timeout, int(
+                    num_entries * timeout_per_entry))
+                print(f"Using auto-calculated timeout of {estimated_timeout} seconds for {num_entries} entries")
+            except:
+                estimated_timeout = 1800
+                print(f"Could not count entries, using default timeout of {estimated_timeout} seconds")
+
         matcher_stdout, matcher_stderr, matcher_retcode = run_command(
-            matcher_cmd)
+            matcher_cmd, timeout=estimated_timeout)
 
         if matcher_retcode != 0:
             print(f"Error: Matcher script failed for run {run_number}. Skipping evaluation.")
@@ -164,40 +249,54 @@ def main():
             result_row["Status"] = "Matcher Output Missing"
 
         else:
+            actual_output_csv = temp_matcher_output_csv
+            if os.path.isdir(temp_matcher_output_csv):
+                csv_files = [f for f in os.listdir(
+                    temp_matcher_output_csv) if f.endswith('.csv')]
+                if csv_files:
+                    actual_output_csv = os.path.join(
+                        temp_matcher_output_csv, csv_files[0])
+                    print(f"Found output CSV in directory: {actual_output_csv}")
+                else:
+                    print(f"Error: No CSV file found in directory '{temp_matcher_output_csv}' for run {run_number}. Skipping evaluation.")
+                    result_row["Status"] = "Matcher Output Missing"
+                    actual_output_csv = None
 
-            evaluator_cmd = [
-                sys.executable,
-                args.evaluator_script_path,
-                "--reference_csv", args.reference_csv,
-                "--test_csv", temp_matcher_output_csv,
-                "--json-output"
-            ]
+            if actual_output_csv:
+                evaluator_cmd = [
+                    sys.executable,
+                    args.evaluator_script_path,
+                    "--reference_csv", args.reference_csv,
+                    "--test_csv", actual_output_csv,
+                    "--json-output"
+                ]
 
-            eval_stdout, eval_stderr, eval_retcode = run_command(evaluator_cmd)
+                eval_stdout, eval_stderr, eval_retcode = run_command(
+                    evaluator_cmd)
 
-            if eval_retcode != 0 or not eval_stdout:
-                print(f"Error: Evaluator script failed or produced no output for run {run_number}.")
-                result_row["Status"] = "Evaluator Failed"
-                result_row["Error"] = eval_stderr[:500]
+                if eval_retcode != 0 or not eval_stdout:
+                    print(f"Error: Evaluator script failed or produced no output for run {run_number}.")
+                    result_row["Status"] = "Evaluator Failed"
+                    result_row["Error"] = eval_stderr[:500]
 
-            else:
+                else:
 
-                try:
-                    metrics = json.loads(eval_stdout)
-                    if "error" in metrics:
-                        print(f"Error reported by evaluator: {metrics['error']}")
-                        result_row["Status"] = "Evaluator JSON Error"
-                        result_row["Error"] = metrics['error']
-                    else:
+                    try:
+                        metrics = json.loads(eval_stdout)
+                        if "error" in metrics:
+                            print(f"Error reported by evaluator: {metrics['error']}")
+                            result_row["Status"] = "Evaluator JSON Error"
+                            result_row["Error"] = metrics['error']
+                        else:
 
-                        result_row.update(metrics)
-                        result_row["Status"] = "Success"
+                            result_row.update(metrics)
+                            result_row["Status"] = "Success"
 
-                except json.JSONDecodeError:
-                    print(f"Error: Could not decode JSON output from evaluator for run {run_number}.")
-                    print(f"Evaluator STDOUT was: {eval_stdout}")
-                    result_row["Status"] = "Evaluator Output Invalid"
-                    result_row["Error"] = "JSONDecodeError"
+                    except json.JSONDecodeError:
+                        print(f"Error: Could not decode JSON output from evaluator for run {run_number}.")
+                        print(f"Evaluator STDOUT was: {eval_stdout}")
+                        result_row["Status"] = "Evaluator Output Invalid"
+                        result_row["Error"] = "JSONDecodeError"
 
         try:
 
@@ -272,8 +371,11 @@ def main():
     print("Parameters:")
     param_cols = list(PARAM_GRID.keys())
     for p in param_cols:
-
-        print(f"  {p}: {best_run.get(p, 'N/A')}")
+        value = best_run.get(p, 'N/A')
+        if isinstance(value, float):
+            print(f"  {p}: {value:.4f}")
+        else:
+            print(f"  {p}: {value}")
     print("Metrics:")
 
     print(f"  Precision: {best_run.get('Precision', 'N/A'):.4f}")

@@ -6,6 +6,15 @@ import unicodedata
 import requests
 from rapidfuzz import fuzz
 from unidecode import unidecode
+
+try:
+    from pylate import models, rank
+    import torch
+    RERANKER_AVAILABLE = True
+except ImportError as e:
+    RERANKER_AVAILABLE = False
+    _reranker_import_error = str(e)
+
 from matching.utils import (
     crossref_rest_api_call,
     doi_id,
@@ -28,12 +37,12 @@ class PreprintSbmvStrategy:
     )
     default = False
 
-    DEFAULT_MIN_SCORE = 0.85
+    DEFAULT_MIN_SCORE = 0.8
     DEFAULT_MAX_SCORE_DIFF = 0.03
     DEFAULT_MAX_QUERY_LEN = 5000
     DEFAULT_WEIGHT_YEAR = 0.4
     DEFAULT_WEIGHT_TITLE = 2.0
-    DEFAULT_WEIGHT_AUTHOR = 0.8
+    DEFAULT_WEIGHT_AUTHOR = 1.0
 
     accepted_crossref_types = [
         "journal-article",
@@ -50,6 +59,11 @@ class PreprintSbmvStrategy:
                  weight_title=DEFAULT_WEIGHT_TITLE,
                  weight_author=DEFAULT_WEIGHT_AUTHOR,
                  max_query_len=DEFAULT_MAX_QUERY_LEN,
+                 enable_reranker=False,
+                 reranker_model_path='lightonai/GTE-ModernColBERT-v1',
+                 reranker_batch_size=16,
+                 heuristic_weight=0.3,
+                 reranker_weight=0.6,
                  request_timeout=DEFAULT_REQUEST_TIMEOUT,
                  max_retries=DEFAULT_MAX_RETRIES,
                  backoff_factor=DEFAULT_BACKOFF_FACTOR,
@@ -86,6 +100,27 @@ class PreprintSbmvStrategy:
         if self.log_candidates:
             self.logger.info(f"Candidate logging enabled. Raw candidates will be saved to: {self.candidate_log_file}")
 
+        self.enable_reranker = enable_reranker
+        self.reranker_model = None
+        self.reranker_batch_size = reranker_batch_size
+        self.heuristic_weight = heuristic_weight
+        self.reranker_weight = reranker_weight
+
+        if self.enable_reranker:
+            if not RERANKER_AVAILABLE:
+                self.logger.error(f"Reranker dependencies not available: {_reranker_import_error}")
+                self.enable_reranker = False
+                self.logger.warning("Reranker disabled due to missing dependencies. Falling back to heuristic-only mode.")
+            else:
+                try:
+                    self.logger.info(f"Reranker enabled. Loading model: {reranker_model_path}...")
+                    self.reranker_model = models.ColBERT(model_name_or_path=reranker_model_path)
+                    self.logger.info("Reranker model loaded successfully.")
+                except Exception as e:
+                    self.logger.error(f"Failed to load reranker model: {e}", exc_info=True)
+                    self.enable_reranker = False
+                    self.logger.warning("Reranker disabled due to loading failure. Falling back to heuristic-only mode.")
+
         try:
             self.session = get_crossref_api_session(
                 max_retries=self.max_retries,
@@ -100,7 +135,85 @@ class PreprintSbmvStrategy:
         self.logger.info(f"Strategy initialized with parameters: min_score={self.min_score}, "
                          f"max_score_diff={self.max_score_diff}, weight_year={self.weight_year}, "
                          f"weight_title={self.weight_title}, weight_author={self.weight_author}, "
-                         f"timeout={self.request_timeout}, max_retries={self.max_retries}")
+                         f"timeout={self.request_timeout}, max_retries={self.max_retries}, "
+                         f"enable_reranker={self.enable_reranker}, reranker_batch_size={self.reranker_batch_size}, "
+                         f"heuristic_weight={self.heuristic_weight}, reranker_weight={self.reranker_weight}")
+
+    def _get_text_from_datacite(self, article_datacite):
+        attributes = article_datacite.get("attributes", {})
+        if not isinstance(attributes, dict):
+            return ""
+        title = ""
+        titles_list = attributes.get("titles", [])
+        main_title = ""
+        subtitle = ""
+        if isinstance(titles_list, list):
+            found_main = False
+            for t in titles_list:
+                if isinstance(t, dict):
+                    t_type = t.get("titleType", "").lower() if t.get(
+                        "titleType") else "main"
+                    t_title = t.get("title", "")
+                    if t_title:
+                        if t_type == "main" and not main_title:
+                            main_title = t_title
+                            found_main = True
+                        elif t_type == "subtitle" and not subtitle:
+                            subtitle = t_title
+            if not found_main and not main_title and titles_list:
+                for t in titles_list:
+                    if isinstance(t, dict) and t.get("title"):
+                        main_title = t.get("title")
+                        break
+
+        if main_title:
+            title = main_title
+            if subtitle:
+                title = f"{main_title}: {subtitle}".strip().rstrip(':').strip()
+
+        if title:
+            title = re.sub("&amp;", "&", title)
+            title = re.sub("&lt;", "<", title)
+            title = re.sub("&gt;", ">", title)
+            title = re.sub(r'\s+', ' ', title).strip()
+
+        author_names = []
+        people = []
+        creators = attributes.get("creators", [])
+        contributors = attributes.get("contributors", [])
+        if isinstance(creators, list):
+            people.extend(creators)
+        if isinstance(contributors, list):
+            people.extend([p for p in contributors if isinstance(
+                p, dict) and p.get("nameType") == "Personal"])
+
+        for person in people:
+            if isinstance(person, dict) and person.get("nameType") == "Personal":
+                family_name = person.get("familyName")
+                if family_name and family_name.strip():
+                    author_names.append(family_name.strip())
+
+        authors_str = " ".join(sorted(list(set(filter(None, author_names)))))
+
+        return f"{title} {authors_str}".strip()
+
+    def _get_text_from_crossref(self, candidate_crossref):
+        if not isinstance(candidate_crossref, dict):
+            return ""
+
+        title = ""
+        cr_titles = candidate_crossref.get("title", [])
+        if cr_titles and isinstance(cr_titles, list):
+            title = cr_titles[0] if cr_titles[0] else ""
+
+        authors = []
+        cr_authors = candidate_crossref.get("author", [])
+        if cr_authors and isinstance(cr_authors, list):
+            for author in cr_authors:
+                if isinstance(author, dict) and author.get("family"):
+                    authors.append(author.get("family"))
+
+        return f"{title} {' '.join(authors)}".strip()
 
     def __del__(self):
         if hasattr(self, 'session') and self.session:
@@ -229,56 +342,116 @@ class PreprintSbmvStrategy:
             self.logger.error(f"An unexpected error occurred during candidate logging: {e}", exc_info=True)
 
     def match_candidates(self, article_datacite, candidates_crossref):
-        input_doi = article_datacite.get(
-            "id") or article_datacite.get("doi", "N/A")
+        input_doi = article_datacite.get("id") or article_datacite.get("doi", "N/A")
         if not candidates_crossref:
             return []
-
-        scores = []
+        heuristic_scores = {}
         for cand in candidates_crossref:
-            if isinstance(cand, dict):
+            if isinstance(cand, dict) and cand.get("DOI"):
                 cand_doi = cand.get("DOI")
-                if cand_doi:
-                    score = self.score(article_datacite, cand)
-                    if score is not None:
-                        scores.append((cand_doi, score))
-                else:
-                    if "DOI" not in cand:
-                        self.logger.debug(f"Candidate missing DOI field for input DOI {input_doi}: {str(cand)[:100]}")
+                score = self.score(article_datacite, cand)
+                if score is not None:
+                    heuristic_scores[cand_doi] = score
             else:
-                self.logger.debug(f"Candidate item is not a dict for input DOI {input_doi}: {str(cand)[:100]}")
+                if isinstance(cand, dict) and "DOI" not in cand:
+                    self.logger.debug(f"Candidate missing DOI field for input DOI {input_doi}: {str(cand)[:100]}")
+                elif not isinstance(cand, dict):
+                    self.logger.debug(f"Candidate item is not a dict for input DOI {input_doi}: {str(cand)[:100]}")
 
-        matches = [(d, s) for d, s in scores if s >= self.min_score]
+        if not self.enable_reranker or not self.reranker_model or not heuristic_scores:
+            matches = [(d, s) for d, s in heuristic_scores.items() if s >= self.min_score]
+            
+            if not matches:
+                self.logger.debug(f"No candidates met min_score ({self.min_score}) for input DOI {input_doi}.")
+                return []
 
+            try:
+                top_score = max((s for _, s in matches), default=None)
+                if top_score is None:
+                    self.logger.warning(f"Could not determine top score for DOI {input_doi} despite having matches.")
+                    return []
+            except ValueError:
+                self.logger.warning(f"Value error determining top score for DOI {input_doi}.")
+                return []
+
+            final_matches = [(d, s) for d, s in matches if top_score - s < self.max_score_diff]
+
+            formatted_results = [
+                {"id": doi_id(doi), "confidence": round(score, 4), "strategies": [self.strategy]}
+                for doi, score in final_matches
+            ]
+
+            if formatted_results:
+                self.logger.info(f"Found {len(formatted_results)} final match(es) for input DOI {input_doi} "
+                                f"(Top score: {top_score:.4f}, Min score: {self.min_score}, Max diff: {self.max_score_diff}).")
+            return formatted_results
+
+        reranker_scores = {}
+        try:
+            query_text = self._get_text_from_datacite(article_datacite)
+            
+            docs_to_rerank = []
+            doc_ids_to_rerank = []
+            for cand in candidates_crossref:
+                cand_doi = cand.get("DOI")
+                if cand_doi in heuristic_scores:
+                    docs_to_rerank.append(self._get_text_from_crossref(cand))
+                    doc_ids_to_rerank.append(cand_doi)
+            
+            if query_text and docs_to_rerank:
+                self.logger.debug(f"Reranking {len(docs_to_rerank)} candidates for input DOI {input_doi}")
+                
+                query_embedding = self.reranker_model.encode([query_text], is_query=True, batch_size=1)
+                doc_embeddings = self.reranker_model.encode(docs_to_rerank, is_query=False, batch_size=self.reranker_batch_size)
+
+                reranked_results = rank.rerank(
+                    documents_ids=[doc_ids_to_rerank],
+                    queries_embeddings=query_embedding,
+                    documents_embeddings=[doc_embeddings]
+                )
+
+                if reranked_results and reranked_results[0]:
+                    scores_list = [item['score'] for item in reranked_results[0]]
+                    min_score, max_score = min(scores_list), max(scores_list)
+                    
+                    for item in reranked_results[0]:
+                        normalized_score = (item['score'] - min_score) / (max_score - min_score) if max_score > min_score else 0.0
+                        reranker_scores[item['id']] = normalized_score
+        
+        except Exception as e:
+            self.logger.error(f"Reranking failed for input DOI {input_doi}: {e}", exc_info=True)
+            reranker_scores = {}
+
+        final_scores = {}
+        for doi, h_score in heuristic_scores.items():
+            r_score = reranker_scores.get(doi, 0.0)
+            
+            if reranker_scores:
+                final_score = (self.heuristic_weight * h_score) + (self.reranker_weight * r_score)
+            else:
+                final_score = h_score
+                
+            final_scores[doi] = final_score
+            self.logger.debug(f"Scores for {doi}: Heuristic={h_score:.4f}, Reranker={r_score:.4f} -> Final={final_score:.4f}")
+
+        matches = [(d, s) for d, s in final_scores.items() if s >= self.min_score]
+        
         if not matches:
             self.logger.debug(f"No candidates met min_score ({self.min_score}) for input DOI {input_doi}.")
             return []
 
-        try:
-            top_score = max((s for _, s in matches), default=None)
-            if top_score is None:
-                self.logger.warning(f"Could not determine top score for DOI {input_doi} despite having matches.")
-                return []
-        except ValueError:
-            self.logger.warning(f"Value error determining top score for DOI {input_doi}.")
-            return []
-
-        final_matches = [
-            (d, s) for d, s in matches if top_score - s < self.max_score_diff
-        ]
+        top_score = max((s for _, s in matches), default=0.0)
+        final_matches = [(d, s) for d, s in matches if top_score - s < self.max_score_diff]
 
         formatted_results = [
-            {
-                "id": doi_id(doi),
-                "confidence": round(score, 4),
-                "strategies": [self.strategy],
-            }
+            {"id": doi_id(doi), "confidence": round(score, 4), "strategies": [self.strategy]}
             for doi, score in final_matches
         ]
-
+        
         if formatted_results:
-            self.logger.info(f"Found {len(formatted_results)} final match(es) for input DOI {input_doi} "
-                             f"(Top score: {top_score:.4f}, Min score: {self.min_score}, Max diff: {self.max_score_diff}).")
+            score_type = "hybrid" if reranker_scores else "heuristic-only"
+            self.logger.info(f"Found {len(formatted_results)} final match(es) for input DOI {input_doi} using {score_type} scoring "
+                            f"(Top score: {top_score:.4f}, Min score: {self.min_score}, Max diff: {self.max_score_diff}).")
 
         return formatted_results
 
