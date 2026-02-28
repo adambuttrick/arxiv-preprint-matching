@@ -1,0 +1,31 @@
+{
+    "@context": "https://w3id.org/codemeta/3.0",
+    "author": [
+        {
+            "affiliation": {
+                "name": "California Digital Library",
+                "@type": "Organization"
+            },
+            "email": "adam.buttrick@ucop.edu",
+            "familyName": "Buttrick",
+            "givenName": "Adam",
+            "@id": "https://orcid.org/0000-0003-1507-1031",
+            "@type": "Person"
+        }
+    ],
+    "codeRepository": "https://github.com/cometadata/arxiv-preprint-matching.git",
+    "description": "Preprint matching arXiv DOIs to subsequently published works in Crossref ",
+    "funder": {
+        "name": "The Navigation Fund",
+        "@type": "Organization"
+    },
+    "keywords": [
+        "arXiv",
+        "preprint"
+    ],
+    "name": "COMET arXiv Preprint Matching",
+    "programmingLanguage": "Python3",
+    "relatedLink": "https://doi.org/10.82461/m8a8-m211",
+    "funding": "https://doi.org/10.71707/yj21-5d60",
+    "@type": "SoftwareSourceCode"
+}
